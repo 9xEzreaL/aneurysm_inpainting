@@ -10,16 +10,30 @@ class Network(BaseNetwork):
         super(Network, self).__init__(**kwargs)
         if module_name == 'sr3':
             from .sr3_modules.unet import UNet
+        elif module_name == 'sr3_3d':
+            from .sr3_modules_3d.unet import UNet
         elif module_name == 'guided_diffusion':
             from .guided_diffusion_modules.unet import UNet
+        elif module_name == 'guided_diffusion_3d':
+            from .guided_diffusion_modules_3d.unet import UNet
         
         self.denoise_fn = UNet(**unet)
         self.beta_schedule = beta_schedule
+        # Detect if using 3D module based on module_name
+        self.is_3d = module_name.endswith('_3d')
 
     def set_loss(self, loss_fn):
         self.loss_fn = loss_fn
 
-    def set_new_noise_schedule(self, device=torch.device('cuda'), phase='train'):
+    def set_new_noise_schedule(self, device=None, phase='train'):
+        # Auto-detect device from model parameters if not provided
+        if device is None:
+            if next(self.parameters()).is_cuda:
+                device = next(self.parameters()).device
+            elif torch.cuda.is_available():
+                device = torch.device('cuda')
+            else:
+                device = torch.device('cpu')
         to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
         betas = make_beta_schedule(**self.beta_schedule[phase])
         betas = betas.detach().cpu().numpy() if isinstance(
@@ -59,9 +73,16 @@ class Network(BaseNetwork):
         return posterior_mean, posterior_log_variance_clipped
 
     def p_mean_variance(self, y_t, t, clip_denoised: bool, y_cond=None):
-        noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
+        # Support both 2D and 3D: determine x_shape based on input tensor dimensions
+        if self.is_3d:
+            x_shape = (1, 1, 1, 1, 1)  # 3D: B, C, D, H, W
+        else:
+            x_shape = (1, 1, 1, 1)  # 2D: B, C, H, W
+        noise_level = extract(self.gammas, t, x_shape=x_shape).to(y_t.device)
+        # Flatten noise_level to (b,) for denoise_fn
+        noise_level_flat = noise_level.view(noise_level.shape[0], -1)[:, 0]
         y_0_hat = self.predict_start_from_noise(
-                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level))
+                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level_flat))
 
         if clip_denoised:
             y_0_hat.clamp_(-1., 1.)
@@ -105,21 +126,39 @@ class Network(BaseNetwork):
     def forward(self, y_0, y_cond=None, mask=None, noise=None):
         # sampling from p(gammas)
         b, *_ = y_0.shape
+        # Support both 2D and 3D: determine x_shape based on input tensor dimensions
+        if self.is_3d:
+            x_shape = (1, 1, 1, 1, 1)  # 3D: B, C, D, H, W
+        else:
+            x_shape = (1, 1, 1, 1)  # 2D: B, C, H, W
         t = torch.randint(1, self.num_timesteps, (b,), device=y_0.device).long()
-        gamma_t1 = extract(self.gammas, t-1, x_shape=(1, 1))
-        sqrt_gamma_t2 = extract(self.gammas, t, x_shape=(1, 1))
+        gamma_t1 = extract(self.gammas, t-1, x_shape=x_shape)
+        sqrt_gamma_t2 = extract(self.gammas, t, x_shape=x_shape)
+        # sample_gammas will have shape matching x_shape (e.g., (b, 1, 1, 1, 1) for 3D)
         sample_gammas = (sqrt_gamma_t2-gamma_t1) * torch.rand((b, 1), device=y_0.device) + gamma_t1
-        sample_gammas = sample_gammas.view(b, -1)
+        # Flatten to (b, 1) for easier handling
+        sample_gammas_flat = sample_gammas.view(b, -1)[:, 0:1]  # Ensure shape is (b, 1)
 
         noise = default(noise, lambda: torch.randn_like(y_0))
+        # Support both 2D (4D tensor: B,C,H,W) and 3D (5D tensor: B,C,D,H,W)
+        if self.is_3d:
+            # 3D: expand to (B, 1, 1, 1, 1) for broadcasting with (B, C, D, H, W)
+            sample_gammas_expanded = sample_gammas_flat.view(b, 1, 1, 1, 1)
+        else:
+            # 2D: expand to (B, 1, 1, 1) for broadcasting with (B, C, H, W)
+            sample_gammas_expanded = sample_gammas_flat.view(b, 1, 1, 1)
         y_noisy = self.q_sample(
-            y_0=y_0, sample_gammas=sample_gammas.view(-1, 1, 1, 1), noise=noise)
+            y_0=y_0, sample_gammas=sample_gammas_expanded, noise=noise)
 
         if mask is not None:
-            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
+            # For inpainting: mask should have same spatial dimensions as y_0
+            # 2D: mask shape should be (B, 1, H, W) or (B, C, H, W)
+            # 3D: mask shape should be (B, 1, D, H, W) or (B, C, D, H, W)
+            # Use flattened sample_gammas for denoise_fn (it expects 1D)
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas_flat.squeeze(-1))
             loss = self.loss_fn(mask*noise, mask*noise_hat)
         else:
-            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy], dim=1), sample_gammas)
+            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy], dim=1), sample_gammas_flat.squeeze(-1))
             loss = self.loss_fn(noise, noise_hat)
         return loss
 

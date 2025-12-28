@@ -4,6 +4,8 @@ import importlib
 from datetime import datetime
 import logging
 import pandas as pd
+import numpy as np
+import torch
 
 import core.util as Util
 
@@ -107,11 +109,46 @@ class VisualWriter():
         ''' get names and corresponding images from results[OrderedDict] '''
         try:
             names = results['name']
-            outputs = Util.postprocess(results['result'])
-            for i in range(len(names)): 
-                Image.fromarray(outputs[i]).save(os.path.join(result_path, names[i]))
-        except:
-            raise NotImplementedError('You must specify the context of name and result in save_current_results functions of model.')
+            outputs = results['result']
+            
+            # Check if we're dealing with 3D volumes (5D tensors: B, C, D, H, W)
+            # or 2D images (4D tensors: B, C, H, W)
+            is_3d = False
+            if len(outputs) > 0:
+                first_output = outputs[0]
+                if isinstance(first_output, torch.Tensor) and first_output.dim() == 5:
+                    is_3d = True
+            
+            if is_3d:
+                # Save 3D volumes as NIfTI files
+                import nibabel as nib
+                for i in range(len(names)):
+                    volume = outputs[i]
+                    # volume shape: (C, D, H, W) or (1, D, H, W)
+                    if volume.dim() == 5:
+                        volume = volume[0]  # Remove batch dimension if present
+                    if volume.dim() == 4:
+                        volume = volume[0]  # Remove channel dimension: (D, H, W)
+                    
+                    # Convert to numpy and permute back to (X, Y, Z) = (width, height, depth)
+                    volume_np = volume.numpy()
+                    # Permute from (D, H, W) = (Z, Y, X) back to (X, Y, Z)
+                    volume_np = volume_np.transpose(2, 1, 0)  # (Z, Y, X) -> (X, Y, Z)
+                    
+                    # Create NIfTI image
+                    nii_img = nib.Nifti1Image(volume_np, affine=np.eye(4))
+                    # Save with .nii.gz extension if not already present
+                    save_name = names[i]
+                    if not save_name.endswith('.nii.gz') and not save_name.endswith('.nii'):
+                        save_name = save_name + '.nii.gz'
+                    nib.save(nii_img, os.path.join(result_path, save_name))
+            else:
+                # Save 2D images as before
+                outputs = Util.postprocess(outputs)
+                for i in range(len(names)): 
+                    Image.fromarray(outputs[i]).save(os.path.join(result_path, names[i]))
+        except Exception as e:
+            raise NotImplementedError(f'Error saving results: {str(e)}. You must specify the context of name and result in save_current_results functions of model.')
 
     def close(self):
         self.writer.close()

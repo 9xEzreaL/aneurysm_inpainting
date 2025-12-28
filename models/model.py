@@ -1,5 +1,6 @@
 import torch
 import tqdm
+import numpy as np
 from core.base_model import BaseModel
 from core.logger import LogTracker
 import copy
@@ -56,29 +57,68 @@ class Palette(BaseModel):
         self.sample_num = sample_num
         self.task = task
         
+        # Detect if using 3D network
+        if self.opt['distributed']:
+            self.is_3d = self.netG.module.is_3d if hasattr(self.netG.module, 'is_3d') else False
+        else:
+            self.is_3d = self.netG.is_3d if hasattr(self.netG, 'is_3d') else False
+        
     def set_input(self, data):
         ''' must use set_device in tensor '''
         self.cond_image = self.set_device(data.get('cond_image'))
         self.gt_image = self.set_device(data.get('gt_image'))
         self.mask = self.set_device(data.get('mask'))
-        self.mask_image = data.get('mask_image')
+        mask_image = data.get('mask_image')
+        # Ensure mask_image is a tensor if it exists
+        if mask_image is not None:
+            if not isinstance(mask_image, torch.Tensor):
+                mask_image = torch.from_numpy(mask_image).float() if isinstance(mask_image, np.ndarray) else mask_image
+            self.mask_image = mask_image
+        else:
+            self.mask_image = None
         self.path = data['path']
         self.batch_size = len(data['path'])
     
     def get_current_visuals(self, phase='train'):
-        dict = {
-            'gt_image': (self.gt_image.detach()[:].float().cpu()+1)/2,
-            'cond_image': (self.cond_image.detach()[:].float().cpu()+1)/2,
-        }
-        if self.task in ['inpainting','uncropping']:
-            dict.update({
-                'mask': self.mask.detach()[:].float().cpu(),
-                'mask_image': (self.mask_image+1)/2,
-            })
-        if phase != 'train':
-            dict.update({
-                'output': (self.output.detach()[:].float().cpu()+1)/2
-            })
+        # For 3D data, we need different handling
+        if self.is_3d:
+            # For 3D: normalize to [0, 1] range without assuming [-1, 1] input
+            # Since nnUNet normalization produces Z-score, we need to clip and normalize
+            def normalize_3d(tensor):
+                tensor = tensor.detach()[:].float().cpu()
+                # Clip to reasonable range (e.g., [-3, 3] for Z-score) and normalize to [0, 1]
+                tensor = torch.clamp(tensor, -3.0, 3.0)
+                tensor = (tensor + 3.0) / 6.0  # Map [-3, 3] to [0, 1]
+                return tensor
+            
+            dict = {
+                'gt_image': normalize_3d(self.gt_image),
+                'cond_image': normalize_3d(self.cond_image),
+            }
+            if self.task in ['inpainting','uncropping']:
+                dict.update({
+                    'mask': self.mask.detach()[:].float().cpu(),
+                    'mask_image': normalize_3d(self.mask_image) if self.mask_image is not None else None,
+                })
+            if phase != 'train':
+                dict.update({
+                    'output': normalize_3d(self.output)
+                })
+        else:
+            # For 2D: assume [-1, 1] range (original behavior)
+            dict = {
+                'gt_image': (self.gt_image.detach()[:].float().cpu()+1)/2,
+                'cond_image': (self.cond_image.detach()[:].float().cpu()+1)/2,
+            }
+            if self.task in ['inpainting','uncropping']:
+                dict.update({
+                    'mask': self.mask.detach()[:].float().cpu(),
+                    'mask_image': (self.mask_image+1)/2 if self.mask_image is not None else None,
+                })
+            if phase != 'train':
+                dict.update({
+                    'output': (self.output.detach()[:].float().cpu()+1)/2
+                })
         return dict
 
     def save_current_results(self):
@@ -88,15 +128,24 @@ class Palette(BaseModel):
             ret_path.append('GT_{}'.format(self.path[idx]))
             ret_result.append(self.gt_image[idx].detach().float().cpu())
 
-            ret_path.append('Process_{}'.format(self.path[idx]))
-            ret_result.append(self.visuals[idx::self.batch_size].detach().float().cpu())
+            if hasattr(self, 'visuals') and self.visuals is not None:
+                ret_path.append('Process_{}'.format(self.path[idx]))
+                ret_result.append(self.visuals[idx::self.batch_size].detach().float().cpu())
             
-            ret_path.append('Out_{}'.format(self.path[idx]))
-            ret_result.append(self.visuals[idx-self.batch_size].detach().float().cpu())
+            if hasattr(self, 'output') and self.output is not None:
+                ret_path.append('Out_{}'.format(self.path[idx]))
+                ret_result.append(self.output[idx].detach().float().cpu())
         
         if self.task in ['inpainting','uncropping']:
-            ret_path.extend(['Mask_{}'.format(name) for name in self.path])
-            ret_result.extend(self.mask_image)
+            if self.mask_image is not None:
+                # Handle both list and tensor cases
+                if isinstance(self.mask_image, list):
+                    ret_result.extend(self.mask_image)
+                else:
+                    # If it's a tensor, convert to list
+                    for idx in range(self.batch_size):
+                        ret_result.append(self.mask_image[idx].detach().float().cpu() if isinstance(self.mask_image, torch.Tensor) else self.mask_image[idx])
+                ret_path.extend(['Mask_{}'.format(name) for name in self.path])
 
         self.results_dict = self.results_dict._replace(name=ret_path, result=ret_result)
         return self.results_dict._asdict()
@@ -156,7 +205,19 @@ class Palette(BaseModel):
                     self.val_metrics.update(key, value)
                     self.writer.add_scalar(key, value)
                 for key, value in self.get_current_visuals(phase='val').items():
-                    self.writer.add_images(key, value)
+                    if value is not None:
+                        if self.is_3d:
+                            # For 3D volumes, extract middle slice for visualization
+                            if value.dim() == 5:
+                                d_mid = value.shape[2] // 2
+                                value_2d = value[:, :, d_mid, :, :]  # (B, C, H, W)
+                                if value_2d.shape[1] == 1:
+                                    value_2d = value_2d.squeeze(1).unsqueeze(1).repeat(1, 3, 1, 1)  # (B, 3, H, W)
+                                self.writer.add_images(key, value_2d)
+                            else:
+                                self.writer.add_images(key, value)
+                        else:
+                            self.writer.add_images(key, value)
                 self.writer.save_images(self.save_current_results())
 
         return self.val_metrics.result()
@@ -188,7 +249,19 @@ class Palette(BaseModel):
                     self.test_metrics.update(key, value)
                     self.writer.add_scalar(key, value)
                 for key, value in self.get_current_visuals(phase='test').items():
-                    self.writer.add_images(key, value)
+                    if value is not None:
+                        if self.is_3d:
+                            # For 3D volumes, extract middle slice for visualization
+                            if value.dim() == 5:
+                                d_mid = value.shape[2] // 2
+                                value_2d = value[:, :, d_mid, :, :]  # (B, C, H, W)
+                                if value_2d.shape[1] == 1:
+                                    value_2d = value_2d.squeeze(1).unsqueeze(1).repeat(1, 3, 1, 1)  # (B, 3, H, W)
+                                self.writer.add_images(key, value_2d)
+                            else:
+                                self.writer.add_images(key, value)
+                        else:
+                            self.writer.add_images(key, value)
                 self.writer.save_images(self.save_current_results())
         
         test_log = self.test_metrics.result()
