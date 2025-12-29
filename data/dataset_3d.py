@@ -84,7 +84,7 @@ class Inpaint3DDataset(data.Dataset):
     def __init__(self, data_root, csv_path, mask_size_range=(10, 30), 
                  data_len=-1, hu_min=-1000, hu_max=1000,
                  normalization='nnunet', foreground_percentiles=(0.5, 99.5),
-                 global_mean=None, global_std=None):
+                 global_mean=None, global_std=None, image_size=None):
         super(Inpaint3DDataset, self).__init__()
         
         # Load NIfTI files
@@ -141,11 +141,98 @@ class Inpaint3DDataset(data.Dataset):
         self.global_mean = global_mean
         self.global_std = global_std
         
+        # Image size for random crop: [D, H, W] or None (no crop)
+        if image_size is not None:
+            if isinstance(image_size, (list, tuple)) and len(image_size) == 3:
+                # Convert to (D, H, W) = (depth, height, width) = (Z, Y, X)
+                self.image_size = tuple(image_size)  # (D, H, W)
+            else:
+                raise ValueError(f"image_size must be a 3-element list/tuple [D, H, W], got: {image_size}")
+        else:
+            self.image_size = None
+        
         print(f"Loaded {len(self.samples)} samples from {len(nifti_files)} NIfTI files")
         print(f"Using normalization: {normalization}")
+        if self.image_size is not None:
+            print(f"Using random crop with size: {self.image_size} (D, H, W)")
     
     def __len__(self):
         return len(self.samples)
+    
+    def _random_crop_with_mask(self, image, mask):
+        """
+        Random crop that ensures the crop region contains at least part of the mask.
+        
+        Args:
+            image: numpy array of shape (X, Y, Z) = (width, height, depth)
+            mask: numpy array of shape (X, Y, Z) = (width, height, depth)
+        
+        Returns:
+            cropped_image: numpy array of shape (X, Y, Z) = (crop_width, crop_height, crop_depth)
+            cropped_mask: numpy array of shape (X, Y, Z) = (crop_width, crop_height, crop_depth)
+        """
+        width, height, depth = image.shape  # (X, Y, Z)
+        crop_d, crop_h, crop_w = self.image_size  # (D, H, W) = (Z, Y, X)
+        
+        # If image is smaller than crop size, pad or use entire image
+        if depth < crop_d or height < crop_h or width < crop_w:
+            # Option 1: Pad to crop size
+            pad_d = max(0, crop_d - depth)
+            pad_h = max(0, crop_h - height)
+            pad_w = max(0, crop_w - width)
+            
+            pad_d_before = pad_d // 2
+            pad_d_after = pad_d - pad_d_before
+            pad_h_before = pad_h // 2
+            pad_h_after = pad_h - pad_h_before
+            pad_w_before = pad_w // 2
+            pad_w_after = pad_w - pad_w_before
+            
+            image = np.pad(image, ((pad_w_before, pad_w_after), (pad_h_before, pad_h_after), (pad_d_before, pad_d_after)), 
+                          mode='constant', constant_values=0)
+            mask = np.pad(mask, ((pad_w_before, pad_w_after), (pad_h_before, pad_h_after), (pad_d_before, pad_d_after)), 
+                         mode='constant', constant_values=0)
+            width, height, depth = image.shape
+        
+        # Find all mask positions (non-zero voxels)
+        mask_positions = np.where(mask > 0)
+        
+        if len(mask_positions[0]) == 0:
+            # No mask found, do regular random crop
+            x_start = np.random.randint(0, max(1, width - crop_w + 1))
+            y_start = np.random.randint(0, max(1, height - crop_h + 1))
+            z_start = np.random.randint(0, max(1, depth - crop_d + 1))
+        else:
+            # Ensure crop contains at least part of the mask
+            # Strategy: Randomly select a mask point, then ensure it's within the crop region
+            mask_idx = np.random.randint(0, len(mask_positions[0]))
+            mask_x = mask_positions[0][mask_idx]
+            mask_y = mask_positions[1][mask_idx]
+            mask_z = mask_positions[2][mask_idx]
+            
+            # Calculate valid crop start positions that include this mask point
+            # The mask point should be within [start, start + crop_size)
+            x_min = max(0, mask_x - crop_w + 1)
+            x_max = min(width - crop_w + 1, mask_x + 1)
+            y_min = max(0, mask_y - crop_h + 1)
+            y_max = min(height - crop_h + 1, mask_y + 1)
+            z_min = max(0, mask_z - crop_d + 1)
+            z_max = min(depth - crop_d + 1, mask_z + 1)
+            
+            # Ensure valid range
+            x_start = np.random.randint(x_min, max(x_min + 1, x_max))
+            y_start = np.random.randint(y_min, max(y_min + 1, y_max))
+            z_start = np.random.randint(z_min, max(z_min + 1, z_max))
+        
+        # Perform crop: (X, Y, Z) format
+        cropped_image = image[x_start:x_start + crop_w, 
+                             y_start:y_start + crop_h, 
+                             z_start:z_start + crop_d]
+        cropped_mask = mask[x_start:x_start + crop_w, 
+                           y_start:y_start + crop_h, 
+                           z_start:z_start + crop_d]
+        
+        return cropped_image, cropped_mask
     
     def __getitem__(self, index):
         sample = self.samples[index]
@@ -180,16 +267,6 @@ class Inpaint3DDataset(data.Dataset):
         else:
             # Use simple normalization
             image_normalized = ct_normalize_simple(image_data, self.hu_min, self.hu_max)
-        
-        # Convert to torch tensor: shape is (X, Y, Z) = (width, height, depth)
-        image_tensor = torch.from_numpy(image_normalized).float()
-        
-        # Permute to (Z, Y, X) = (depth, height, width) for 3D network
-        # 3D UNet expects (C, D, H, W) format where D is depth/slice dimension
-        image_tensor = image_tensor.permute(2, 1, 0)  # (X, Y, Z) -> (Z, Y, X) = (D, H, W)
-        
-        # Add channel dimension: (1, D, H, W) = (1, Z, Y, X)
-        image_tensor = image_tensor.unsqueeze(0)
         
         # Generate combined mask from all bounding boxes
         # Initialize mask as zeros - shape should match image_data: (width, height, depth) = (X, Y, Z)
@@ -232,6 +309,22 @@ class Inpaint3DDataset(data.Dataset):
             
             # Combine masks (union of all bounding box masks)
             mask = np.maximum(mask, bbox_mask)
+        
+        # Apply random crop if image_size is specified
+        if self.image_size is not None:
+            image_normalized, mask = self._random_crop_with_mask(image_normalized, mask)
+            # Update dimensions after crop
+            width, height, depth = image_normalized.shape
+        
+        # Convert to torch tensor: shape is (X, Y, Z) = (width, height, depth)
+        image_tensor = torch.from_numpy(image_normalized).float()
+        
+        # Permute to (Z, Y, X) = (depth, height, width) for 3D network
+        # 3D UNet expects (C, D, H, W) format where D is depth/slice dimension
+        image_tensor = image_tensor.permute(2, 1, 0)  # (X, Y, Z) -> (Z, Y, X) = (D, H, W)
+        
+        # Add channel dimension: (1, D, H, W) = (1, Z, Y, X)
+        image_tensor = image_tensor.unsqueeze(0)
         
         # Convert mask to torch tensor: shape is (X, Y, Z) = (width, height, depth)
         mask_tensor = torch.from_numpy(mask).float()

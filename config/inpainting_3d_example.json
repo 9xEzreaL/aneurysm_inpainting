@@ -76,14 +76,15 @@
           "global_mean": null,
           "global_std": null,
           "hu_min": -1000,
-          "hu_max": 1000
+          "hu_max": 1000,
+          "image_size": [128, 128, 96]
         }
       },
       "dataloader": {
         "args": {
           "batch_size": 1,
           "shuffle": true,
-          "num_workers": 4,
+          "num_workers": 0,
           "pin_memory": true,
           "drop_last": false
         },
@@ -110,7 +111,7 @@
         "args": {
           "batch_size": 1,
           "shuffle": false,
-          "num_workers": 4,
+          "num_workers": 0,
           "pin_memory": true,
           "drop_last": false
         }
