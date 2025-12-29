@@ -9,11 +9,19 @@ from torchvision.utils import make_grid
 def tensor2img(tensor, out_type=np.uint8, min_max=(-1, 1)):
     '''
     Converts a torch Tensor into an image Numpy array
-    Input: 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
+    Input: 5D(B,C,D,H,W), 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
     Output: 3D(H,W,C) or 2D(H,W), [0,255], np.uint8 (default)
+    For 5D tensors (3D volumes), extracts middle slice for visualization
     '''
     tensor = tensor.clamp_(*min_max)  # clamp
     n_dim = tensor.dim()
+    if n_dim == 5:
+        # 5D tensor: (B, C, D, H, W) - 3D volume
+        # Extract middle slice along depth dimension
+        b, c, d, h, w = tensor.shape
+        d_mid = d // 2
+        tensor = tensor[:, :, d_mid, :, :]  # (B, C, H, W)
+        n_dim = 4
     if n_dim == 4:
         n_img = len(tensor)
         img_np = make_grid(tensor, nrow=int(math.sqrt(n_img)), normalize=False).numpy()
@@ -24,7 +32,7 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(-1, 1)):
     elif n_dim == 2:
         img_np = tensor.numpy()
     else:
-        raise TypeError('Only support 4D, 3D and 2D tensor. But received with dimension: {:d}'.format(n_dim))
+        raise TypeError('Only support 5D, 4D, 3D and 2D tensor. But received with dimension: {:d}'.format(n_dim))
     if out_type == np.uint8:
         img_np = ((img_np+1) * 127.5).round()
         # Important. Unlike matlab, numpy.unit8() WILL NOT round by default.

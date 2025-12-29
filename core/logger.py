@@ -111,42 +111,64 @@ class VisualWriter():
             names = results['name']
             outputs = results['result']
             
-            # Check if we're dealing with 3D volumes (5D tensors: B, C, D, H, W)
-            # or 2D images (4D tensors: B, C, H, W)
-            is_3d = False
-            if len(outputs) > 0:
-                first_output = outputs[0]
-                if isinstance(first_output, torch.Tensor) and first_output.dim() == 5:
-                    is_3d = True
+            # Process each output individually - handle 3D and 2D separately
+            import nibabel as nib
+            processed_outputs = []
+            processed_names = []
             
-            if is_3d:
-                # Save 3D volumes as NIfTI files
-                import nibabel as nib
-                for i in range(len(names)):
-                    volume = outputs[i]
-                    # volume shape: (C, D, H, W) or (1, D, H, W)
-                    if volume.dim() == 5:
-                        volume = volume[0]  # Remove batch dimension if present
-                    if volume.dim() == 4:
-                        volume = volume[0]  # Remove channel dimension: (D, H, W)
-                    
-                    # Convert to numpy and permute back to (X, Y, Z) = (width, height, depth)
-                    volume_np = volume.numpy()
-                    # Permute from (D, H, W) = (Z, Y, X) back to (X, Y, Z)
-                    volume_np = volume_np.transpose(2, 1, 0)  # (Z, Y, X) -> (X, Y, Z)
-                    
-                    # Create NIfTI image
-                    nii_img = nib.Nifti1Image(volume_np, affine=np.eye(4))
-                    # Save with .nii.gz extension if not already present
-                    save_name = names[i]
-                    if not save_name.endswith('.nii.gz') and not save_name.endswith('.nii'):
-                        save_name = save_name + '.nii.gz'
-                    nib.save(nii_img, os.path.join(result_path, save_name))
-            else:
-                # Save 2D images as before
-                outputs = Util.postprocess(outputs)
-                for i in range(len(names)): 
-                    Image.fromarray(outputs[i]).save(os.path.join(result_path, names[i]))
+            for i in range(len(names)):
+                output = outputs[i]
+                name = names[i]
+                
+                # Check if this is a 3D volume (5D or 4D tensor)
+                if isinstance(output, torch.Tensor):
+                    if output.dim() == 5:
+                        # 5D tensor: (B, C, D, H, W) -> save as NIfTI
+                        volume = output[0]  # Remove batch dimension: (C, D, H, W)
+                        if volume.dim() == 4:
+                            volume = volume[0]  # Remove channel dimension: (D, H, W)
+                        
+                        # Convert to numpy and permute back to (X, Y, Z) = (width, height, depth)
+                        volume_np = volume.detach().cpu().numpy()
+                        # Permute from (D, H, W) = (Z, Y, X) back to (X, Y, Z)
+                        volume_np = volume_np.transpose(2, 1, 0)  # (Z, Y, X) -> (X, Y, Z)
+                        
+                        # Create NIfTI image
+                        nii_img = nib.Nifti1Image(volume_np, affine=np.eye(4))
+                        # Save with .nii.gz extension if not already present
+                        save_name = name
+                        if not save_name.endswith('.nii.gz') and not save_name.endswith('.nii'):
+                            save_name = save_name + '.nii.gz'
+                        nib.save(nii_img, os.path.join(result_path, save_name))
+                        continue
+                    elif output.dim() == 4:
+                        # 4D tensor: could be (B, C, H, W) for 2D or (C, D, H, W) for 3D
+                        # Check if it's likely 3D by checking if D dimension is large
+                        if output.shape[1] > 1 and output.shape[2] > 10:
+                            # Likely 3D: (C, D, H, W) or (1, D, H, W)
+                            volume = output[0] if output.shape[0] > 1 else output.squeeze(0)  # (D, H, W)
+                            
+                            # Convert to numpy and permute back to (X, Y, Z)
+                            volume_np = volume.detach().cpu().numpy()
+                            volume_np = volume_np.transpose(2, 1, 0)  # (Z, Y, X) -> (X, Y, Z)
+                            
+                            # Create NIfTI image
+                            nii_img = nib.Nifti1Image(volume_np, affine=np.eye(4))
+                            save_name = name
+                            if not save_name.endswith('.nii.gz') and not save_name.endswith('.nii'):
+                                save_name = save_name + '.nii.gz'
+                            nib.save(nii_img, os.path.join(result_path, save_name))
+                            continue
+                
+                # For 2D images or other formats, add to list for postprocessing
+                processed_outputs.append(output)
+                processed_names.append(name)
+            
+            # Process remaining 2D images
+            if len(processed_outputs) > 0:
+                processed_outputs = Util.postprocess(processed_outputs)
+                for i in range(len(processed_names)): 
+                    Image.fromarray(processed_outputs[i]).save(os.path.join(result_path, processed_names[i]))
         except Exception as e:
             raise NotImplementedError(f'Error saving results: {str(e)}. You must specify the context of name and result in save_current_results functions of model.')
 
