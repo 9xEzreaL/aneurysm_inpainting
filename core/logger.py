@@ -119,18 +119,17 @@ class VisualWriter():
             for i in range(len(names)):
                 output = outputs[i]
                 name = names[i]
-                
+                print(name, output.shape)
                 # Check if this is a 3D volume (5D or 4D tensor)
                 if isinstance(output, torch.Tensor):
                     if output.dim() == 5:
                         # 5D tensor: (B, C, D, H, W) -> save as NIfTI
-                        volume = output[0]  # Remove batch dimension: (C, D, H, W)
-                        if volume.dim() == 4:
-                            volume = volume[0]  # Remove channel dimension: (D, H, W)
+                        volumes = output.squeeze(1)
                         
-                        # Convert to numpy and permute back to (X, Y, Z) = (width, height, depth)
-                        volume_np = volume.detach().cpu().numpy()
-                        # Permute from (D, H, W) = (Z, Y, X) back to (X, Y, Z)
+                        n_samples, h, w, d = volumes.shape
+                        volumes_np = volumes.detach().cpu().numpy()
+                        
+                        volume_np = np.concatenate([volumes_np[i] for i in range(volumes_np.shape[0])], 0)
                         volume_np = volume_np.transpose(2, 1, 0)  # (Z, Y, X) -> (X, Y, Z)
                         
                         # Create NIfTI image
@@ -141,6 +140,7 @@ class VisualWriter():
                             save_name = save_name + '.nii.gz'
                         nib.save(nii_img, os.path.join(result_path, save_name))
                         continue
+                        
                     elif output.dim() == 4:
                         # 4D tensor: could be (B, C, H, W) for 2D or (C, D, H, W) for 3D
                         # Check if it's likely 3D by checking if D dimension is large

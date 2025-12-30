@@ -168,7 +168,19 @@ class Palette(BaseModel):
                     self.logger.info('{:5s}: {}\t'.format(str(key), value))
                     self.writer.add_scalar(key, value)
                 for key, value in self.get_current_visuals().items():
-                    self.writer.add_images(key, value)
+                    if value is not None:
+                        if self.is_3d:
+                            # For 3D volumes, extract middle slice for visualization
+                            if value.dim() == 5:
+                                d_mid = value.shape[2] // 2
+                                value_2d = value[:, :, d_mid, :, :]  # (B, C, H, W)
+                                if value_2d.shape[1] == 1:
+                                    value_2d = value_2d.squeeze(1).unsqueeze(1).repeat(1, 3, 1, 1)  # (B, 3, H, W)
+                                self.writer.add_images(key, value_2d)
+                            else:
+                                self.writer.add_images(key, value)
+                        else:
+                            self.writer.add_images(key, value)
             if self.ema_scheduler is not None:
                 if self.iter > self.ema_scheduler['ema_start'] and self.iter % self.ema_scheduler['ema_iter'] == 0:
                     self.EMA.update_model_average(self.netG_EMA, self.netG)
@@ -195,7 +207,7 @@ class Palette(BaseModel):
                             y_0=self.gt_image, mask=self.mask, sample_num=self.sample_num)
                     else:
                         self.output, self.visuals = self.netG.restoration(self.cond_image, sample_num=self.sample_num)
-                    
+
                 self.iter += self.batch_size
                 self.writer.set_iter(self.epoch, self.iter, phase='val')
 
